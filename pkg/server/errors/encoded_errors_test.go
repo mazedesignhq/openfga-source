@@ -4,10 +4,11 @@ import (
 	"net/http"
 	"testing"
 
-	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 )
 
 func TestEncodedError(t *testing.T) {
@@ -18,9 +19,16 @@ func TestEncodedError(t *testing.T) {
 		expectedCode           int
 		expectedCodeString     string
 		expectedHTTPStatusCode int
-		isValidEncodedError    bool
 	}
 	var tests = []encodedTests{
+		{
+			_name:                  "aborted_error",
+			errorCode:              int32(codes.Aborted),
+			message:                "error message",
+			expectedHTTPStatusCode: http.StatusConflict,
+			expectedCode:           int(codes.Aborted),
+			expectedCodeString:     "Aborted",
+		},
 		{
 			_name:                  "invalid_error",
 			errorCode:              20,
@@ -28,7 +36,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusInternalServerError,
 			expectedCode:           20,
 			expectedCodeString:     "20",
-			isValidEncodedError:    false,
 		},
 		{
 			_name:                  "auth_error:_invalid subject",
@@ -37,7 +44,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusUnauthorized,
 			expectedCode:           1001,
 			expectedCodeString:     "auth_failed_invalid_subject",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "auth_error:_invalid_audience",
@@ -46,7 +52,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusUnauthorized,
 			expectedCode:           1002,
 			expectedCodeString:     "auth_failed_invalid_audience",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "auth_error:_invalid issuer",
@@ -55,7 +60,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusUnauthorized,
 			expectedCode:           1003,
 			expectedCodeString:     "auth_failed_invalid_issuer",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "auth_error:_invalid_claims",
@@ -64,7 +68,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusUnauthorized,
 			expectedCode:           1004,
 			expectedCodeString:     "invalid_claims",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "auth_error:_invalid_bearer_token",
@@ -73,7 +76,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusUnauthorized,
 			expectedCode:           1005,
 			expectedCodeString:     "auth_failed_invalid_bearer_token",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "auth_error:_missing_bearer_token",
@@ -82,7 +84,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusUnauthorized,
 			expectedCode:           1010,
 			expectedCodeString:     "bearer_token_missing",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "auth_error:_unauthorized",
@@ -91,7 +92,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusUnauthorized,
 			expectedCode:           1500,
 			expectedCodeString:     "unauthenticated",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "validation_error",
@@ -100,7 +100,14 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusBadRequest,
 			expectedCode:           2000,
 			expectedCodeString:     "validation_error",
-			isValidEncodedError:    true,
+		},
+		{
+			_name:                  "throttle_error",
+			errorCode:              int32(openfgav1.UnprocessableContentErrorCode_throttled_timeout_error),
+			message:                "error message",
+			expectedHTTPStatusCode: http.StatusUnprocessableEntity,
+			expectedCode:           3500,
+			expectedCodeString:     "throttled_timeout_error",
 		},
 		{
 			_name:                  "internal_error",
@@ -109,7 +116,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusInternalServerError,
 			expectedCode:           4000,
 			expectedCodeString:     "internal_error",
-			isValidEncodedError:    true,
 		},
 		{
 			_name:                  "undefined_endpoint",
@@ -118,7 +124,6 @@ func TestEncodedError(t *testing.T) {
 			expectedHTTPStatusCode: http.StatusNotFound,
 			expectedCode:           5000,
 			expectedCodeString:     "undefined_endpoint",
-			isValidEncodedError:    true,
 		},
 	}
 	for _, test := range tests {
@@ -128,7 +133,6 @@ func TestEncodedError(t *testing.T) {
 			require.Equal(t, test.expectedHTTPStatusCode, actualError.HTTPStatusCode)
 			require.Equal(t, test.expectedCodeString, actualError.Code())
 			require.Equal(t, int32(test.expectedCode), actualError.CodeValue())
-			require.Equal(t, test.isValidEncodedError, IsValidEncodedError(actualError.CodeValue()))
 		})
 	}
 }
@@ -153,7 +157,7 @@ func TestConvertToEncodedErrorCode(t *testing.T) {
 		{
 			_name:             "cancelled",
 			status:            status.New(codes.Canceled, "other error"),
-			expectedErrorCode: int32(openfgav1.InternalErrorCode_cancelled),
+			expectedErrorCode: int32(openfgav1.ErrorCode_cancelled),
 		},
 		{
 			_name:             "unknown",
@@ -188,7 +192,7 @@ func TestConvertToEncodedErrorCode(t *testing.T) {
 		{
 			_name:             "aborted",
 			status:            status.New(codes.Aborted, "other error"),
-			expectedErrorCode: int32(openfgav1.InternalErrorCode_aborted),
+			expectedErrorCode: int32(codes.Aborted),
 		},
 		{
 			_name:             "out_of_range",
@@ -279,11 +283,6 @@ func TestConvertToEncodedErrorCode(t *testing.T) {
 			_name:             "invalid_argument_-_Object_length",
 			status:            status.New(codes.InvalidArgument, "invalid WriteTokenIssuersRequest.Params: embedded message failed validation | caused by: invalid WriteTokenIssuersRequestParams.Object: value length must be at most 256 bytes"),
 			expectedErrorCode: int32(openfgav1.ErrorCode_object_too_long),
-		},
-		{
-			_name:             "invalid_argument_-_Object_invalid_pattern",
-			status:            status.New(codes.InvalidArgument, "invalid WriteTokenIssuersRequest.Params: embedded message failed validation | caused by: invalid WriteTokenIssuersRequestParams.Object: value does not match regex pattern"),
-			expectedErrorCode: int32(openfgav1.ErrorCode_object_invalid_pattern),
 		},
 		{
 			_name:             "invalid_argument_-_PageSize",

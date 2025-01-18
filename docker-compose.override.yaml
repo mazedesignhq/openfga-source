@@ -6,13 +6,17 @@ services:
   openfga:
     image: !reset null
     build: .
+    depends_on:
+      otel-collector:
+        condition: service_started
     environment:
       - OPENFGA_TRACE_ENABLED=true
       - OPENFGA_TRACE_SAMPLE_RATIO=1
       - OPENFGA_TRACE_OTLP_ENDPOINT=otel-collector:4317
       - OPENFGA_METRICS_ENABLE_RPC_HISTOGRAMS=true
       - OPENFGA_DATASTORE_METRICS_ENABLED=true
-      - OPENFGA_METRICS_ENABLED=TRUE
+      - OPENFGA_METRICS_ENABLED=true
+
   otel-collector:
     image: otel/opentelemetry-collector:latest
     container_name: otel-collector
@@ -21,12 +25,9 @@ services:
       - "./telemetry/otel-collector-config.yaml:/etc/otel-collector-config.yaml"
     networks:
       - default
-    ports:
-      - "4317:4317" #grpc OTLP receiver
-      - "2113:2113" #prometheus metrics exporter
 
   jaeger:
-    image: jaegertracing/all-in-one:latest
+    image: jaegertracing/all-in-one:1.49
     container_name: jaeger
     command: [ "--query.max-clock-skew-adjustment", "500ms" ]
     environment:
@@ -36,17 +37,16 @@ services:
       - BADGER_DIRECTORY_VALUE=/badger/data
       - BADGER_DIRECTORY_KEY=/badger/key
     volumes:
-      - jaegar_data:/badger
+      - jaeger_data:/badger
     ports:
       - "16686:16686" # UI
-      - "4317" # OTLP gRPC default port
     depends_on:
       - otel-collector
     networks:
       - default
 
   prometheus:
-    image: prom/prometheus:v2.30.3
+    image: prom/prometheus:latest
     ports:
       - 9090:9090 # UI
     depends_on:
@@ -76,4 +76,4 @@ services:
 volumes:
   prometheus_data:
   grafana_data:
-  jaegar_data:
+  jaeger_data:

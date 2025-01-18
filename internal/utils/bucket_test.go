@@ -28,10 +28,10 @@ func TestBucketize(t *testing.T) {
 			expected: "40",
 		},
 		{
-			name:     "single_bucket_smaller",
+			name:     "single_bucket_larger",
 			input:    uint(60),
 			buckets:  []uint{40},
-			expected: ">40",
+			expected: "+Inf",
 		},
 		{
 			name:     "multiple_bucket_smaller",
@@ -55,12 +55,11 @@ func TestBucketize(t *testing.T) {
 			name:     "multiple_bucket_larger",
 			input:    uint(61),
 			buckets:  []uint{40, 60},
-			expected: ">60",
+			expected: "+Inf",
 		},
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -68,4 +67,9 @@ func TestBucketize(t *testing.T) {
 			require.Equal(t, test.expected, output)
 		})
 	}
+}
+
+func TestLinearBuckets(t *testing.T) {
+	buckets := LinearBuckets(1.0, 100, 10)
+	require.Equal(t, []float64{1, 12, 23, 34, 45, 56, 67, 78, 89, 100}, buckets)
 }

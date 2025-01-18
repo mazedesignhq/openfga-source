@@ -5,7 +5,13 @@ import (
 	"errors"
 	"fmt"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+
+	"github.com/openfga/openfga/internal/server/config"
 	"github.com/openfga/openfga/internal/validation"
 	"github.com/openfga/openfga/pkg/logger"
 	serverErrors "github.com/openfga/openfga/pkg/server/errors"
@@ -16,16 +22,37 @@ import (
 
 // WriteCommand is used to Write and Delete tuples. Instances may be safely shared by multiple goroutines.
 type WriteCommand struct {
-	logger    logger.Logger
-	datastore storage.OpenFGADatastore
+	logger                    logger.Logger
+	datastore                 storage.OpenFGADatastore
+	conditionContextByteLimit int
 }
 
-// NewWriteCommand creates a WriteCommand with specified storage.TupleBackend to use for storage.
-func NewWriteCommand(datastore storage.OpenFGADatastore, logger logger.Logger) *WriteCommand {
-	return &WriteCommand{
-		logger:    logger,
-		datastore: datastore,
+type WriteCommandOption func(*WriteCommand)
+
+func WithWriteCmdLogger(l logger.Logger) WriteCommandOption {
+	return func(wc *WriteCommand) {
+		wc.logger = l
 	}
+}
+
+func WithConditionContextByteLimit(limit int) WriteCommandOption {
+	return func(wc *WriteCommand) {
+		wc.conditionContextByteLimit = limit
+	}
+}
+
+// NewWriteCommand creates a WriteCommand with specified storage.OpenFGADatastore to use for storage.
+func NewWriteCommand(datastore storage.OpenFGADatastore, opts ...WriteCommandOption) *WriteCommand {
+	cmd := &WriteCommand{
+		datastore:                 datastore,
+		logger:                    logger.NewNoopLogger(),
+		conditionContextByteLimit: config.DefaultWriteContextByteLimit,
+	}
+
+	for _, opt := range opts {
+		opt(cmd)
+	}
+	return cmd
 }
 
 // Execute deletes and writes the specified tuples. Deletes are applied first, then writes.
@@ -34,9 +61,20 @@ func (c *WriteCommand) Execute(ctx context.Context, req *openfgav1.WriteRequest)
 		return nil, err
 	}
 
-	err := c.datastore.Write(ctx, req.GetStoreId(), req.GetDeletes().GetTupleKeys(), req.GetWrites().GetTupleKeys())
+	err := c.datastore.Write(
+		ctx,
+		req.GetStoreId(),
+		req.GetDeletes().GetTupleKeys(),
+		req.GetWrites().GetTupleKeys(),
+	)
 	if err != nil {
-		return nil, handleError(err)
+		if errors.Is(err, storage.ErrTransactionalWriteFailed) {
+			return nil, status.Error(codes.Aborted, err.Error())
+		}
+		if errors.Is(err, storage.ErrInvalidWriteInput) {
+			return nil, serverErrors.WriteFailedDueToInvalidInput(err)
+		}
+		return nil, serverErrors.HandleError("", err)
 	}
 
 	return &openfgav1.WriteResponse{}, nil
@@ -51,8 +89,8 @@ func (c *WriteCommand) validateWriteRequest(ctx context.Context, req *openfgav1.
 	deletes := req.GetDeletes().GetTupleKeys()
 	writes := req.GetWrites().GetTupleKeys()
 
-	if deletes == nil && writes == nil {
-		return serverErrors.InvalidWriteInput
+	if len(deletes) == 0 && len(writes) == 0 {
+		return serverErrors.ErrInvalidWriteInput
 	}
 
 	if len(writes) > 0 {
@@ -61,24 +99,41 @@ func (c *WriteCommand) validateWriteRequest(ctx context.Context, req *openfgav1.
 			if errors.Is(err, storage.ErrNotFound) {
 				return serverErrors.AuthorizationModelNotFound(modelID)
 			}
-			return err
+			return serverErrors.HandleError("", err)
 		}
 
 		if !typesystem.IsSchemaVersionSupported(authModel.GetSchemaVersion()) {
 			return serverErrors.ValidationError(typesystem.ErrInvalidSchemaVersion)
 		}
 
-		typesys := typesystem.New(authModel)
+		typesys, err := typesystem.New(authModel)
+		if err != nil {
+			return err
+		}
 
 		for _, tk := range writes {
-			err := validation.ValidateTuple(typesys, tk)
+			err := validation.ValidateTupleForWrite(typesys, tk)
 			if err != nil {
 				return serverErrors.ValidationError(err)
+			}
+
+			err = c.validateNotImplicit(tk)
+			if err != nil {
+				return err
+			}
+
+			contextSize := proto.Size(tk.GetCondition().GetContext())
+			if contextSize > c.conditionContextByteLimit {
+				return serverErrors.ValidationError(&tupleUtils.InvalidTupleError{
+					Cause:    fmt.Errorf("condition context size limit exceeded: %d bytes exceeds %d bytes", contextSize, c.conditionContextByteLimit),
+					TupleKey: tk,
+				})
 			}
 		}
 	}
 
 	for _, tk := range deletes {
+		// TODO validate relation format and object format
 		if ok := tupleUtils.IsValidUser(tk.GetUser()); !ok {
 			return serverErrors.ValidationError(
 				&tupleUtils.InvalidTupleError{
@@ -97,7 +152,10 @@ func (c *WriteCommand) validateWriteRequest(ctx context.Context, req *openfgav1.
 }
 
 // validateNoDuplicatesAndCorrectSize ensures the deletes and writes contain no duplicates and length fits.
-func (c *WriteCommand) validateNoDuplicatesAndCorrectSize(deletes []*openfgav1.TupleKey, writes []*openfgav1.TupleKey) error {
+func (c *WriteCommand) validateNoDuplicatesAndCorrectSize(
+	deletes []*openfgav1.TupleKeyWithoutCondition,
+	writes []*openfgav1.TupleKey,
+) error {
 	tuples := map[string]struct{}{}
 
 	for _, tk := range deletes {
@@ -122,12 +180,16 @@ func (c *WriteCommand) validateNoDuplicatesAndCorrectSize(deletes []*openfgav1.T
 	return nil
 }
 
-func handleError(err error) error {
-	if errors.Is(err, storage.ErrTransactionalWriteFailed) {
-		return serverErrors.NewInternalError("concurrent write conflict", err)
-	} else if errors.Is(err, storage.ErrInvalidWriteInput) {
-		return serverErrors.WriteFailedDueToInvalidInput(err)
+// validateNotImplicit ensures the tuple to be written (not deleted) is not of the form `object:id # relation @ object:id#relation`.
+func (c *WriteCommand) validateNotImplicit(
+	tk *openfgav1.TupleKey,
+) error {
+	userObject, userRelation := tupleUtils.SplitObjectRelation(tk.GetUser())
+	if tk.GetRelation() == userRelation && tk.GetObject() == userObject {
+		return serverErrors.ValidationError(&tupleUtils.InvalidTupleError{
+			Cause:    fmt.Errorf("cannot write a tuple that is implicit"),
+			TupleKey: tk,
+		})
 	}
-
-	return serverErrors.HandleError("", err)
+	return nil
 }
